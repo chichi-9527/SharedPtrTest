@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <utility>
 #include <string_view>
+#include <type_traits>
+#include <stdexcept>
 
 namespace ITools
 {
@@ -26,18 +28,28 @@ public:
 		: _type(type)
 	{
 	}
+
+	std::uint32_t GetCount() const
+	{
+		return _count;
+	}
 protected:
 	ITools::PtrType _type = ITools::PtrType::UNDEFINED;
+	std::uint32_t _count = 1;
 };
 
+struct IPtr;
 class IPtrManager
 {
 public:
+	using ResolverFunc = void* (*)(void* state);
+	using DeleterFunc = void  (*)(void* state);
 
 	static IPtrManager& GetInstance();
 
 	bool PtrIsValid(size_t ptr_id);
 
+	size_t AddPtr(ResolverFunc resolver, void* resolverState, DeleterFunc  deleter, void* deleterState);
 	size_t AddPtr(void* ptr);
 
 	void SharedPtrInc(size_t ptr_id);
@@ -55,15 +67,71 @@ private:
 	IPtrManager();
 };
 
+namespace detail
+{
+	static void* DefaultResolver(void* state) { return state; }
+	template<typename T>
+	static void DefaultDeleter(void* state)
+	{
+		T* ptr = static_cast<T*>(state);
+		delete ptr;
+	}
+	
+	template<typename T, typename PtrType>
+	T* GetRawPtr(PtrType p)
+	{
+		if constexpr (std::is_pointer_v<PtrType>)
+			return p;
+		else
+			return p.get();
+	}
+	
+	template<typename T, typename Alloc, typename PtrType>
+	struct AllocatorState
+	{
+		Alloc   allocator;
+		PtrType ptrHandle;
+		uint32_t count = 1;
+	};
+	template<typename T, typename Alloc, typename PtrType>
+	void* AllocatorResolver(void* state)
+	{
+		auto* s = static_cast<AllocatorState<T, Alloc, PtrType>*>(state);
+		return GetRawPtr<T>(s->ptrHandle);
+	}
+	
+	template<typename T, typename Alloc, typename PtrType>
+	void AllocatorDeleter(void* state)
+	{
+		auto* s = static_cast<AllocatorState<T, Alloc, PtrType>*>(state);
+		
+		T* ptr = static_cast<T*>(GetRawPtr<T>(s->ptrHandle));
+		if (ptr)
+		{
+			if constexpr (!std::is_trivially_destructible_v<T>)
+			{
+				for (uint32_t i = 0; i < s->count; ++i)
+					ptr[i].~T();
+			}
+		}
+		
+		s->allocator.deallocate(s->ptrHandle, s->count);
+		
+		delete s;
+	}
+} // namespace detail
 
+template<typename CType>
+class IWeakPtr;
 
 template<typename CType>
 class ISharedPtr : public IPtrBase
 {
+	friend class IWeakPtr<CType>;
 public:
 	virtual ~ISharedPtr()
 	{
-		if (_ptr && _entity)
+		if (_entity)
 		{
 			IPtrManager::GetInstance().SharedPtrDec(_entity);
 		}
@@ -80,17 +148,20 @@ public:
 	{
 		if (ptr)
 		{
-			_ptr = ptr;
-			_entity = IPtrManager::GetInstance().AddPtr(ptr);
+			_entity = IPtrManager::GetInstance().AddPtr(&detail::DefaultResolver, ptr, &detail::DefaultDeleter<CType>, ptr);
 		}
-		else
-		{
-			_ptr = nullptr;
-			_entity = 0;
-		}
+
 	}
 
-
+	ISharedPtr(IPtrManager::ResolverFunc resolver, void* resolverState, IPtrManager::DeleterFunc  deleter, void* deleterState, std::uint32_t count = 1)
+		: IPtrBase(ITools::PtrType::SHARED)
+	{
+		if (resolver && resolverState)
+		{
+			_entity = IPtrManager::GetInstance().AddPtr(resolver, resolverState, deleter, deleterState);
+			_count = count;
+		}
+	}
 
 	ISharedPtr(const ISharedPtr& other)
 		: IPtrBase(ITools::PtrType::SHARED)
@@ -102,7 +173,7 @@ public:
 				IPtrManager::GetInstance().SharedPtrDec(_entity);
 			}
 			_entity = other._entity;
-			_ptr = other._ptr;
+			_count = other._count;
 			IPtrManager::GetInstance().SharedPtrInc(_entity);
 		}
 		
@@ -116,50 +187,167 @@ public:
 			IPtrManager::GetInstance().SharedPtrDec(_entity);
 		}
 		_entity = other._entity;
-		_ptr = other._ptr;
+		_count = other._count;
 		other._entity = 0;
-		other._ptr = nullptr;
+		other._count = 1;
 	}
 
-	ISharedPtr(size_t entity)
+	explicit ISharedPtr(size_t entity, std::uint32_t count)
 		: IPtrBase(ITools::PtrType::SHARED)
 	{
 		_entity = entity;
-		if (!IPtrManager::GetInstance().GetPtrAndInc(entity, _ptr))
+		_count = count;
+
+		void* dummy = nullptr;
+		if (!IPtrManager::GetInstance().GetPtrAndInc(entity, dummy))
 		{
 			_entity = 0;
-			_ptr = nullptr;
+			_count = 1;
+		}
+	}
+
+	// 核心工厂：使用任意分配器（包括 IMemPoolAllocator）
+	//
+	// 分配器必须满足：
+	//   - alloc.allocate(n) → PtrType     （PtrType 可为 T* 或 IUserPtr<T>）
+	//   - alloc.deallocate(p, n)
+	//
+	// 对于 IMemPoolAllocator<T>：
+	//   - allocate(1) 返回 IUserPtr<T>
+	//   - GetRawPtr 调用 IUserPtr<T>::get() 每次获取最新地址
+	//   - deallocate 将 IUserPtr<T> 归还池
+	//
+	// 注意：IMemPool 的 Allocate 对 >1024 字节的非平凡类型有 static_assert，
+	//       这是 IMemPool 本身的限制，非本智能指针的问题。
+	template<typename Alloc, typename... Args>
+	static ISharedPtr<CType> Allocate(Alloc& alloc, Args&&... args)
+	{
+		auto ptrHandle = alloc.allocate(1);
+		CType* raw = detail::GetRawPtr<CType>(ptrHandle);
+
+		try
+		{
+			::new (raw) CType(std::forward<Args>(args)...);
+		}
+		catch (...)
+		{
+			alloc.deallocate(ptrHandle, 1);
+			throw;
+		}
+
+		using State = detail::AllocatorState<CType, Alloc, decltype(ptrHandle)>;
+		auto* state = new State{ alloc, ptrHandle, 1 };
+
+		return ISharedPtr<CType>(
+			&detail::AllocatorResolver<CType, Alloc, decltype(ptrHandle)>,
+			state,
+			&detail::AllocatorDeleter<CType, Alloc, decltype(ptrHandle)>,
+			state);
+	}
+	template<typename Alloc>
+	static ISharedPtr<CType> AllocateArray(Alloc& alloc, std::uint32_t n)
+	{
+		if (n == 0) return ISharedPtr<CType>();
+		auto ptrHandle = alloc.allocate(n);
+		CType* raw = detail::GetRawPtr<CType>(ptrHandle);
+		std::uint32_t constructed = 0;
+		try
+		{
+			for (std::uint32_t i = 0; i < n; ++i)
+			{
+				::new (&raw[i]) CType();
+				++constructed;
+			}
+		}
+		catch (...)
+		{
+			for (std::uint32_t i = 0; i < constructed; ++i)
+				raw[i].~CType();
+			alloc.deallocate(ptrHandle, n);
+			throw;
+		}
+		using State = detail::AllocatorState<CType, Alloc, decltype(ptrHandle)>;
+		auto* state = new State{ alloc, ptrHandle, n };
+		return ISharedPtr<CType>(
+			&detail::AllocatorResolver<CType, Alloc, decltype(ptrHandle)>,
+			state,
+			&detail::AllocatorDeleter<CType, Alloc, decltype(ptrHandle)>,
+			state,
+		    n);
+	}
+	template<typename Alloc, typename TInit>
+	static ISharedPtr<CType> AllocateArray(Alloc& alloc,
+		std::initializer_list<TInit> init)
+	{
+		std::uint32_t n = static_cast<std::uint32_t>(init.size());
+		if (n == 0) return ISharedPtr<CType>();
+		auto ptrHandle = alloc.allocate(n);
+		CType* raw = detail::GetRawPtr<CType>(ptrHandle);
+		std::uint32_t constructed = 0;
+		try
+		{
+			auto it = init.begin();
+			for (std::uint32_t i = 0; i < n; ++i, ++it)
+			{
+				::new (&raw[i]) CType(*it);
+				++constructed;
+			}
+		}
+		catch (...)
+		{
+			for (std::uint32_t i = 0; i < constructed; ++i)
+				raw[i].~CType();
+			alloc.deallocate(ptrHandle, n);
+			throw;
+		}
+		using State = detail::AllocatorState<CType, Alloc, decltype(ptrHandle)>;
+		auto* state = new State{ alloc, ptrHandle, n };
+		return ISharedPtr<CType>(
+			&detail::AllocatorResolver<CType, Alloc, decltype(ptrHandle)>,
+			state,
+			&detail::AllocatorDeleter<CType, Alloc, decltype(ptrHandle)>,
+			state,
+			n);
+	}
+
+	CType& operator[](std::size_t index) const
+	{
+		if (index < _count)
+		{
+			return Get()[index];
+		}
+		else
+		{
+			throw std::out_of_range("");
 		}
 	}
 
 	CType* Get() const
 	{
-		return _ptr;
+		return _entity
+			? static_cast<CType*>(IPtrManager::GetInstance().GetPtr(_entity))
+			: nullptr;
 	}
 
 	CType* operator->() const
 	{
-		return _ptr;
+		return Get();
 	}
+
+	CType& operator*()  const { return *Get(); }
 
 	void operator=(CType* ptr)
 	{
-		if (_ptr != ptr)
+		if (_entity) IPtrManager::GetInstance().SharedPtrDec(_entity);
+		if (ptr)
 		{
-			if(_ptr && _entity)
-			{
-				IPtrManager::GetInstance().SharedPtrDec(_entity);
-			}
-			if (ptr)
-			{
-				_ptr = ptr;
-				_entity = IPtrManager::GetInstance().AddPtr(ptr);
-			}
-			else
-			{
-				_ptr = nullptr;
-				_entity = 0;
-			}
+			_entity = IPtrManager::GetInstance().AddPtr(
+				&detail::DefaultResolver, ptr,
+				&detail::DefaultDeleter<CType>, ptr);
+		}
+		else
+		{
+			_entity = 0;
 		}
 	}
 
@@ -172,21 +360,26 @@ public:
 				IPtrManager::GetInstance().SharedPtrDec(_entity);
 			}
 			_entity = other._entity;
-			_ptr = other._ptr;
+			_count = other._count;
 			IPtrManager::GetInstance().SharedPtrInc(_entity);
 		}
 	}
 
 	void operator=(ISharedPtr&& other) noexcept
 	{
-		if (_entity)
+		if (this != &other)
 		{
-			IPtrManager::GetInstance().SharedPtrDec(_entity);
+			if (_entity)
+			{
+				IPtrManager::GetInstance().SharedPtrDec(_entity);
+				
+			}
+			_entity = other._entity;
+			_count = other._count;
+			other._entity = 0;
+			other._count = 1;
 		}
-		_entity = other._entity;
-		_ptr = other._ptr;
-		other._entity = 0;
-		other._ptr = nullptr;
+
 	}
 
 	bool operator==(const ISharedPtr& other) const
@@ -201,12 +394,12 @@ public:
 
 	bool operator==(const CType* ptr) const
 	{
-		return _ptr == ptr;
+		return Get() == ptr;
 	}
 
 	bool operator!=(const CType* ptr) const
 	{
-		return _ptr != ptr;
+		return Get() != ptr;
 	}
 
 	bool IsValid() const
@@ -224,19 +417,16 @@ public:
 	{
 		if (IsValid())
 		{
-			if (auto castedPtr = dynamic_cast<CastType*>(_ptr))
+			if (auto _ = dynamic_cast<CastType*>(Get()))
 			{
-				ISharedPtr<CastType> castedPtr(_entity);
-				return castedPtr;
+				return ISharedPtr<CastType>(_entity, _count);
 			}
 			
 		}
 		return ISharedPtr<CastType>();
 	}
 
-
 private:
-	CType* _ptr = nullptr;
 	size_t _entity = 0;
 };
 
@@ -247,10 +437,11 @@ template<typename CType>
 class IWeakPtr : public IPtrBase
 {
 	friend class IUniquePtr<CType>;
+	friend class ISharedPtr<CType>;
 public:
 	~IWeakPtr()
 	{
-		if (_ptr && _entity)
+		if (_entity)
 		{
 			IPtrManager::GetInstance().WeakPtrDec(_entity);
 		}
@@ -262,6 +453,7 @@ public:
 	}
 
 	IWeakPtr(const IWeakPtr& other)
+		: IPtrBase(other._type)
 	{
 		if (this != &other)
 		{
@@ -270,8 +462,8 @@ public:
 				IPtrManager::GetInstance().WeakPtrDec(_entity);
 			}
 			_entity = other._entity;
-			_ptr = other._ptr;
 			_type = other._type;
+			_count = other._count;
 			IPtrManager::GetInstance().WeakPtrInc(_entity);
 		}
 	}
@@ -282,36 +474,34 @@ public:
 			IPtrManager::GetInstance().WeakPtrDec(_entity);
 		}
 		_entity = other._entity;
-		_ptr = other._ptr;
 		_type = other._type;
+		_count = other._count;
 		other._entity = 0;
-		other._ptr = nullptr;
 		other._type = ITools::PtrType::UNDEFINED;
+		other._count = 1;
 	}
 	IWeakPtr(const ISharedPtr<CType>& other)
+		: IPtrBase(other._type)
 	{
 		if(_entity)
 		{
 			IPtrManager::GetInstance().WeakPtrDec(_entity);
 		}
 		_entity = other._entity;
-		_ptr = other._ptr;
 		_type = other._type;
+		_count = other._count;
 		IPtrManager::GetInstance().WeakPtrInc(_entity);
 	}
-	IWeakPtr(size_t entity, ITools::PtrType type)
+	IWeakPtr(size_t entity, ITools::PtrType type, std::uint32_t count)
 	{
-		if (IPtrManager::GetInstance().GetPtrAndWeakInc(entity, _ptr))
+		void* dummy = nullptr;
+		if (IPtrManager::GetInstance().GetPtrAndWeakInc(entity, dummy))
 		{
 			_entity = entity;
 			_type = type;
+			_count = count;
 		}
-		else
-		{
-			_entity = 0;
-			_ptr = nullptr;
-			_type = ITools::PtrType::UNDEFINED;
-		}
+		
 	}
 
 	void operator=(const IWeakPtr& other)
@@ -323,8 +513,8 @@ public:
 				IPtrManager::GetInstance().WeakPtrDec(_entity);
 			}
 			_entity = other._entity;
-			_ptr = other._ptr;
 			_type = other._type;
+			_count = other._count;
 			IPtrManager::GetInstance().WeakPtrInc(_entity);
 		}
 	}
@@ -335,34 +525,34 @@ public:
 			IPtrManager::GetInstance().WeakPtrDec(_entity);
 		}
 		_entity = other._entity;
-		_ptr = other._ptr;
 		_type = other._type;
+		_count = other._count;
 		other._entity = 0;
-		other._ptr = nullptr;
 		other._type = ITools::PtrType::UNDEFINED;
+		other._count = 1;
 	}
 
 	void operator=(const ISharedPtr<CType>& other)
 	{
-		if(_entity)
+		if (_entity)
 		{
 			IPtrManager::GetInstance().WeakPtrDec(_entity);
 		}
 		_entity = other._entity;
-		_ptr = other._ptr;
 		_type = other._type;
+		_count = other._count;
 		IPtrManager::GetInstance().WeakPtrInc(_entity);
 	}
 
 	void operator=(const IUniquePtr<CType>& other)
 	{
-		if(_entity)
+		if (_entity)
 		{
 			IPtrManager::GetInstance().WeakPtrDec(_entity);
 		}
 		_entity = other._entity;
-		_ptr = other._ptr;
 		_type = other._type;
+		_count = other._count;
 		IPtrManager::GetInstance().WeakPtrInc(_entity);
 	}
 
@@ -378,12 +568,12 @@ public:
 
 	bool operator==(const CType* ptr) const
 	{
-		return _ptr == ptr;
+		return Get() == ptr;
 	}
 
 	bool operator!=(const CType* ptr) const
 	{
-		return _ptr != ptr;
+		return Get() != ptr;
 	}
 
 	bool IsValid() const
@@ -400,10 +590,9 @@ public:
 	{
 		if (IsValid())
 		{
-			if (auto castedPtr = dynamic_cast<CastType*>(_ptr))
+			if (auto _ = dynamic_cast<CastType*>(Get()))
 			{
-				IWeakPtr<CastType> castedPtr(_entity, _type);
-				return castedPtr;
+				return IWeakPtr<CastType>(_entity, _type, _count);
 			}
 		}
 		return IWeakPtr<CastType>();
@@ -416,8 +605,7 @@ public:
 	{
 		if (_type == ITools::PtrType::SHARED && IsValid())
 		{
-			ISharedPtr<CType> sharedPtr(_entity);
-			return sharedPtr;
+			return ISharedPtr<CType>(_entity, _count);
 		}
 		return nullptr;
 	}
@@ -429,7 +617,7 @@ public:
 	{
 		if (IsValid())
 		{
-			return _ptr;
+			return static_cast<CType*>(IPtrManager::GetInstance().GetPtr(_entity));
 		}
 		return nullptr;
 	}
@@ -437,7 +625,6 @@ public:
 
 
 private:
-	CType* _ptr = nullptr;
 	size_t _entity = 0;
 };
 
@@ -447,28 +634,34 @@ class IUniquePtr : public IPtrBase
 public:
 	~IUniquePtr()
 	{
-		if (_ptr && _entity)
+		if (_entity)
 		{
 			IPtrManager::GetInstance().SharedPtrDec(_entity);
 		}
 	}
 	constexpr IUniquePtr() noexcept
 		: IPtrBase(ITools::PtrType::UNIQUE)
-	{
-	}
+	{}
 
 	IUniquePtr(CType* ptr)
 		: IPtrBase(ITools::PtrType::UNIQUE)
 	{
 		if (ptr)
 		{
-			_ptr = ptr;
-			_entity = IPtrManager::GetInstance().AddPtr(ptr);
+			_entity = IPtrManager::GetInstance().AddPtr(
+				&detail::DefaultResolver, ptr,
+				&detail::DefaultDeleter<CType>, ptr);
 		}
-		else
+
+	}
+
+	IUniquePtr(IPtrManager::ResolverFunc resolver, void* resolverState, IPtrManager::DeleterFunc  deleter, void* deleterState, std::uint32_t count = 1)
+		: IPtrBase(ITools::PtrType::UNIQUE)
+	{
+		if (resolver && resolverState)
 		{
-			_ptr = nullptr;
-			_entity = 0;
+			_entity = IPtrManager::GetInstance().AddPtr(resolver, resolverState, deleter, deleterState);
+			_count = count;
 		}
 	}
 
@@ -477,21 +670,134 @@ public:
 		: IPtrBase(ITools::PtrType::UNIQUE)
 	{
 		_entity = other._entity;
-		_ptr = other._ptr;
+		_count = other._count;
 		other._entity = 0;
-		other._ptr = nullptr;
+		other._count = 1;
 	}
 
 	void operator=(const IUniquePtr& other) = delete;
 	void operator=(IUniquePtr&& other) noexcept
 	{
-		_entity = other._entity;
-		_ptr = other._ptr;
-		_type = ITools::PtrType::UNIQUE;
-		other._entity = 0;
-		other._ptr = nullptr;
-		other._type = ITools::PtrType::UNDEFINED;
+		if (this != &other)
+		{
+			if (_entity) IPtrManager::GetInstance().SharedPtrDec(_entity);
+			_entity = other._entity;
+			_count = other._count;
+			other._entity = 0;
+			other._count = 1;
+		}
+		
 	}
+
+	template<typename Alloc, typename... Args>
+	static IUniquePtr<CType> Allocate(Alloc& alloc, Args&&... args)
+	{
+		auto ptrHandle = alloc.allocate(1);
+		CType* raw = detail::GetRawPtr<CType>(ptrHandle);
+		try
+		{
+			::new (raw) CType(std::forward<Args>(args)...);
+		}
+		catch (...)
+		{
+			alloc.deallocate(ptrHandle, 1);
+			throw;
+		}
+		using State = detail::AllocatorState<CType, Alloc, decltype(ptrHandle)>;
+		auto* state = new State{ alloc, ptrHandle, 1 };
+		return IUniquePtr<CType>(
+			&detail::AllocatorResolver<CType, Alloc, decltype(ptrHandle)>,
+			state,
+			&detail::AllocatorDeleter<CType, Alloc, decltype(ptrHandle)>,
+			state);
+	}
+	template<typename Alloc>
+	static IUniquePtr<CType> AllocateArray(Alloc& alloc, std::uint32_t n)
+	{
+		if (n == 0) return IUniquePtr<CType>();
+		auto ptrHandle = alloc.allocate(n);
+		CType* raw = detail::GetRawPtr<CType>(ptrHandle);
+		std::uint32_t constructed = 0;
+		try
+		{
+			for (std::uint32_t i = 0; i < n; ++i)
+			{
+				::new (&raw[i]) CType();
+				++constructed;
+			}
+		}
+		catch (...)
+		{
+			for (std::uint32_t i = 0; i < constructed; ++i)
+				raw[i].~CType();
+			alloc.deallocate(ptrHandle, n);
+			throw;
+		}
+		using State = detail::AllocatorState<CType, Alloc, decltype(ptrHandle)>;
+		auto* state = new State{ alloc, ptrHandle, n };
+		return IUniquePtr<CType>(
+			&detail::AllocatorResolver<CType, Alloc, decltype(ptrHandle)>,
+			state,
+			&detail::AllocatorDeleter<CType, Alloc, decltype(ptrHandle)>,
+			state,
+			n);
+	}
+	template<typename Alloc, typename TInit>
+	static IUniquePtr<CType> AllocateArray(Alloc& alloc,
+		std::initializer_list<TInit> init)
+	{
+		std::uint32_t n = static_cast<std::uint32_t>(init.size());
+		if (n == 0) return IUniquePtr<CType>();
+		auto ptrHandle = alloc.allocate(n);
+		CType* raw = detail::GetRawPtr<CType>(ptrHandle);
+		std::uint32_t constructed = 0;
+		try
+		{
+			auto it = init.begin();
+			for (std::uint32_t i = 0; i < n; ++i, ++it)
+			{
+				::new (&raw[i]) CType(*it);
+				++constructed;
+			}
+		}
+		catch (...)
+		{
+			for (std::uint32_t i = 0; i < constructed; ++i)
+				raw[i].~CType();
+			alloc.deallocate(ptrHandle, n);
+			throw;
+		}
+		using State = detail::AllocatorState<CType, Alloc, decltype(ptrHandle)>;
+		auto* state = new State{ alloc, ptrHandle, n };
+		return IUniquePtr<CType>(
+			&detail::AllocatorResolver<CType, Alloc, decltype(ptrHandle)>,
+			state,
+			&detail::AllocatorDeleter<CType, Alloc, decltype(ptrHandle)>,
+			state,
+			n);
+	}
+
+	CType& operator[](std::size_t index) const
+	{
+		if (index < _count)
+		{
+			return Get()[index];
+		}
+		else
+		{
+			throw std::out_of_range();
+		}
+	}
+
+	CType* Get() const 
+	{
+		return _entity
+			? static_cast<CType*>(IPtrManager::GetInstance().GetPtr(_entity))
+			: nullptr;
+	}
+
+	CType* operator->() const { return Get(); }
+	CType& operator*()  const { return *Get(); }
 
 	template<typename WeakType>
 	bool operator==(const IWeakPtr<WeakType>& other) const
@@ -507,12 +813,12 @@ public:
 
 	bool operator==(const CType* ptr) const
 	{
-		return _ptr == ptr;
+		return Get() == ptr;
 	}
 
 	bool operator!=(const CType* ptr) const
 	{
-		return _ptr != ptr;
+		return Get() != ptr;
 	}
 
 	bool IsValid() const
@@ -530,8 +836,8 @@ public:
 	{
 		IWeakPtr<CType> weakPtr;
 		weakPtr._entity = _entity;
-		weakPtr._ptr = _ptr;
 		weakPtr._type = _type;
+		weakPtr._count = _count;
 		IPtrManager::GetInstance().WeakPtrInc(_entity);
 		return weakPtr;
 	}
@@ -539,7 +845,6 @@ public:
 
 
 private:
-	CType* _ptr = nullptr;
 	size_t _entity = 0;
 };
 
@@ -552,10 +857,32 @@ namespace ITools
 		return ISharedPtr<CType>(new CType(std::forward<Args>(args)...));
 	}
 
+	template<typename CType, typename Alloc, typename... Args>
+	ISharedPtr<CType> AllocateIShared(Alloc& alloc, Args&&... args)
+	{
+		return ISharedPtr<CType>::template Allocate<Alloc>(
+			alloc, std::forward<Args>(args)...
+		);
+	}
+
 	template<typename CType, typename CastType>
 	ISharedPtr<CastType> CastIShared(const ISharedPtr<CType>& ptr)
 	{
 		return ptr.CastTo<CastType>();
+	}
+
+	template<typename CType, typename... Args>
+	IUniquePtr<CType> MakeIUnique(Args&&... args)
+	{
+		return IUniquePtr<CType>(new CType(std::forward<Args>(args)...));
+	}
+
+	template<typename CType, typename Alloc, typename... Args>
+	IUniquePtr<CType> AllocateIUnique(Alloc& alloc, Args&&... args)
+	{
+		return IUniquePtr<CType>::template Allocate<Alloc>(
+			alloc, std::forward<Args>(args)...
+		);
 	}
 
 	template<typename CType, typename CastType>

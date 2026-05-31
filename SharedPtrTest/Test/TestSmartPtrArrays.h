@@ -1,0 +1,3 @@
+﻿#pragma once
+
+int TestSmartPtrArrays();

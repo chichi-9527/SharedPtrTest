@@ -42,13 +42,13 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>v145</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>v145</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
@@ -137,9 +137,13 @@
   <ItemGroup>
     <ClCompile Include="ISharedPtr\ISharedPtr.cpp" />
     <ClCompile Include="SharedPtrTest.cpp" />
+    <ClCompile Include="Test\TestSmartPtrArrays.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="IMemPool.h" />
     <ClInclude Include="ISharedPtr\ISharedPtr.h" />
+    <ClInclude Include="Test\TestSmartPtrArrays.h" />
+    <ClInclude Include="Test\TestHelpers.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

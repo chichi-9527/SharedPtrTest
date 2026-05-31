@@ -21,9 +21,21 @@
     <ClCompile Include="ISharedPtr\ISharedPtr.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="Test\TestSmartPtrArrays.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ISharedPtr\ISharedPtr.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="IMemPool.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="Test\TestHelpers.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="Test\TestSmartPtrArrays.h">
       <Filter>头文件</Filter>
     </ClInclude>
   </ItemGroup>

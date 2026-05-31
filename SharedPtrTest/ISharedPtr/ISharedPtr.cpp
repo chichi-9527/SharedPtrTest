@@ -15,32 +15,54 @@ constexpr const char* SafeSizeTTypeName = "size_t";
 
 struct IPtr
 {
-	void* Ptr = nullptr;
+	using ResolverFunc = void* (*)(void* state);
+	using DeleterFunc = void(*)(void* state);
+
 	SafeSizeT SharedCount = 0;
 	SafeSizeT WeakCount = 0;
+	ResolverFunc Resolver = nullptr;
+	void* ResolverState = nullptr;
+	DeleterFunc Deleter = nullptr;
+	void* DeleterState = nullptr;
 
 	IPtr() = default;
-	IPtr(void* ptr)
-	{
-		Ptr = ptr;
-		SharedCount = 1;
-	}
+	IPtr(ResolverFunc resolver, void* resolverState,
+		DeleterFunc  deleter, void* deleterState)
+		: SharedCount(1)
+		, Resolver(resolver), ResolverState(resolverState)
+		, Deleter(deleter), DeleterState(deleterState)
+	{}
 	IPtr(const IPtr& other) = delete;
 	IPtr& operator=(const IPtr& other) = delete;
+#ifndef UNUSE_SAFE_SIZE_T
 	IPtr(IPtr&& other) noexcept
-		: Ptr(other.Ptr), SharedCount(other.SharedCount.load()), WeakCount(other.WeakCount.load())
+		: SharedCount(other.SharedCount.load())
+		, WeakCount(other.WeakCount.load())
+		, Resolver(other.Resolver), ResolverState(other.ResolverState)
+		, Deleter(other.Deleter), DeleterState(other.DeleterState)
 	{
-		other.Ptr = nullptr;
-		other.SharedCount = 0;
-		other.WeakCount = 0;
+		other.Resolver = nullptr;
+		other.ResolverState = nullptr;
+		other.Deleter = nullptr;
+		other.DeleterState = nullptr;
 	}
-	
-
-	void operator=(void* ptr)
+#else
+	IPtr(IPtr&& other) noexcept
+		: SharedCount(other.SharedCount)
+		, WeakCount(other.WeakCount)
+		, Resolver(other.Resolver), ResolverState(other.ResolverState)
+		, Deleter(other.Deleter), DeleterState(other.DeleterState)
 	{
-		Ptr = ptr;
-		SharedCount = 1;
-		WeakCount = 0;
+		other.Resolver = nullptr;
+		other.ResolverState = nullptr;
+		other.Deleter = nullptr;
+		other.DeleterState = nullptr;
+	}
+#endif
+
+	void* GetPtr() const
+	{
+		return Resolver ? Resolver(ResolverState) : nullptr;
 	}
 
 	void operator++()
@@ -68,11 +90,6 @@ struct IPtr
 		}
 	}
 
-	bool operator==(const void* ptr) const
-	{
-		return Ptr == ptr;
-	}
-
 	void WeakInc()
 	{
 		WeakCount++;
@@ -88,12 +105,14 @@ struct IPtr
 
 	bool IsValid() const
 	{
-		return (Ptr != nullptr) && (SharedCount != 0);
+		return Resolver != nullptr && GetPtr() != nullptr && SharedCount > 0;
 	}
 
 	bool CanBeFreeID() const
 	{
-		return (Ptr == nullptr) && (SharedCount == 0) && (WeakCount == 0);
+		return Resolver == nullptr && Deleter == nullptr
+			&& ResolverState == nullptr && DeleterState == nullptr
+			&& SharedCount == 0 && WeakCount == 0;
 	}
 
 };
@@ -105,7 +124,7 @@ static std::mutex IPtrMutex;
 IPtrManager::IPtrManager()
 {
 	IPtrs.reserve(1 << 7);
-	IPtrs.emplace_back(nullptr);
+	IPtrs.emplace_back();
 }
 
 IPtrManager& IPtrManager::GetInstance()
@@ -124,12 +143,12 @@ bool IPtrManager::PtrIsValid(size_t ptr_id)
 	return false;
 }
 
-size_t IPtrManager::AddPtr(void* ptr)
+size_t IPtrManager::AddPtr(ResolverFunc resolver, void* resolverState, DeleterFunc deleter, void* deleterState)
 {
 	if (FreePtrIds.empty())
 	{
 		std::lock_guard<std::mutex> lock(IPtrMutex);
-		IPtrs.emplace_back(ptr);
+		IPtrs.emplace_back(resolver, resolverState, deleter, deleterState);
 		return IPtrs.size() - 1;
 	}
 	else
@@ -137,9 +156,20 @@ size_t IPtrManager::AddPtr(void* ptr)
 		std::lock_guard<std::mutex> lock(IPtrMutex);
 		size_t id = FreePtrIds.front();
 		FreePtrIds.pop();
-		IPtrs[id] = ptr;
+		IPtr& ctrl = IPtrs[id];
+		ctrl.SharedCount = 1;
+		ctrl.WeakCount = 0;
+		ctrl.Resolver = resolver;
+		ctrl.ResolverState = resolverState;
+		ctrl.Deleter = deleter;
+		ctrl.DeleterState = deleterState;
 		return id;
 	}
+}
+
+size_t IPtrManager::AddPtr(void* ptr)
+{
+	return AddPtr(&detail::DefaultResolver, ptr, nullptr, nullptr);
 }
 
 void IPtrManager::SharedPtrInc(size_t ptr_id)
@@ -157,7 +187,9 @@ void IPtrManager::SharedPtrInc(size_t ptr_id)
 
 void IPtrManager::SharedPtrDec(size_t ptr_id)
 {
-	void* ptrToDelete = nullptr;
+	IPtr::DeleterFunc deleter = nullptr;
+	void* deleterState = nullptr;
+
 	{
 		std::lock_guard<std::mutex> lock(IPtrMutex);
 		if (ptr_id < IPtrs.size())
@@ -165,8 +197,13 @@ void IPtrManager::SharedPtrDec(size_t ptr_id)
 			IPtrs[ptr_id]--;
 			if (!IPtrs[ptr_id].IsValid())
 			{
-				ptrToDelete = IPtrs[ptr_id].Ptr;
-				IPtrs[ptr_id].Ptr = nullptr;
+				
+				deleter = IPtrs[ptr_id].Deleter;
+				deleterState = IPtrs[ptr_id].DeleterState;
+				IPtrs[ptr_id].Resolver = nullptr;
+				IPtrs[ptr_id].ResolverState = nullptr;
+				IPtrs[ptr_id].Deleter = nullptr;
+				IPtrs[ptr_id].DeleterState = nullptr;
 				if (IPtrs[ptr_id].CanBeFreeID())
 				{
 					FreePtrIds.push(ptr_id);
@@ -174,8 +211,8 @@ void IPtrManager::SharedPtrDec(size_t ptr_id)
 			}
 		}
 	}
-	if (ptrToDelete)
-		delete ptrToDelete;
+	if (deleter && deleterState)
+		deleter(deleterState);
 }
 
 void IPtrManager::WeakPtrInc(size_t ptr_id)
@@ -210,10 +247,7 @@ void* IPtrManager::GetPtr(size_t ptr_id)
 	if (ptr_id < IPtrs.size())
 	{
 		std::lock_guard<std::mutex> lock(IPtrMutex);
-		if (IPtrs[ptr_id].IsValid())
-		{
-			return IPtrs[ptr_id].Ptr;
-		}
+		return IPtrs[ptr_id].GetPtr();
 	}
 	return nullptr;
 }
@@ -224,7 +258,7 @@ bool IPtrManager::GetPtrAndInc(size_t ptr_id, void*& ptr)
 	if (ptr_id < IPtrs.size() && IPtrs[ptr_id].IsValid())
 	{
 		IPtrs[ptr_id]++;
-		ptr = IPtrs[ptr_id].Ptr;
+		ptr = IPtrs[ptr_id].GetPtr();
 		return true;
 	}
 	return false;
@@ -236,7 +270,7 @@ bool IPtrManager::GetPtrAndWeakInc(size_t ptr_id, void*& ptr)
 	if (ptr_id < IPtrs.size() && IPtrs[ptr_id].IsValid())
 	{
 		IPtrs[ptr_id].WeakInc();
-		ptr = IPtrs[ptr_id].Ptr;
+		ptr = IPtrs[ptr_id].GetPtr();
 		return true;
 	}
 	return false;

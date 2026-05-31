@@ -2,6 +2,8 @@
 //
 
 #include "ISharedPtr/ISharedPtr.h"
+#include "IMemPool.h"
+#include "Test/TestSmartPtrArrays.h"
 
 #include <iostream>
 #include <vector>
@@ -19,6 +21,11 @@ public:
 
 private:
 
+};
+
+// 辅助测试类 2：测试大内存分配（触发通用池）
+struct BigObject {
+	double data[1000]; // 8000 字节 > 1024
 };
 
 
@@ -40,6 +47,30 @@ int main()
 	std::cout << ptr2->add(3, 4) << std::endl;
 	std::cout << weakPtrFromUnique.Get()->add(5, 6) << std::endl;
 	std::cout << weakPtrFromUnique2.Get()->add(7, 8) << std::endl;
+
+	IMemPool* pool = IMemPool::CreatePool();
+	// IMemPoolAllocator 就是一个普通分配器，与其他分配器用法完全一致
+	IMemPoolAllocator<BigObject> alloc(pool);
+
+	auto sp1 = ITools::AllocateIShared<BigObject>(alloc);
+	sp1->data[0] = 1.1;
+
+	auto p1 = pool->New<BigObject>(1);
+	p1->data[0] = 3.3;
+
+	auto up1 = ITools::AllocateIUnique<BigObject>(alloc);
+	up1->data[0] = 2.2;
+
+	pool->Deallocate(p1, 1);
+
+	pool->DefragmentGeneralPool();
+
+	assert(sp1->data[0] == 1.1);
+	assert(up1->data[0] == 2.2);
+	std::cout << sp1->data[0] << std::endl;
+	std::cout << up1->data[0] << std::endl;
+
+	return TestSmartPtrArrays();
 
 	return 0;
 }
